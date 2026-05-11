@@ -14,6 +14,8 @@ python s3upload.py --download ./my-folder
 ```
 
 - Uploads/downloads a full directory tree to/from S3
+- Transfers multiple files concurrently (default 4 workers, configurable)
+- Per-file progress with live MB/total and percentage
 - Skips files that already exist (safe to run repeatedly)
 - Preserves folder structure exactly
 - Supports any S3-compatible storage (Backblaze B2, Cloudflare R2, MinIO, etc.)
@@ -60,8 +62,9 @@ Downloads everything under `s3://your-bucket/my-folder/` into `./my-folder/`.
 | `--upload <dir>` | Upload local directory to S3 |
 | `--download <dir>` | Download from S3 into local directory |
 | `--overwrite` | Overwrite files that already exist |
-| `--dry-run` | Show what would happen without doing anything |
+| `--dry-run` | Show what would happen without doing anything (no S3 calls) |
 | `--include-hidden` | Include hidden files and directories (`.dotfiles`) |
+| `--workers N` | Concurrent file transfers (default: `4`) |
 
 ### Dry run first
 
@@ -69,7 +72,19 @@ Downloads everything under `s3://your-bucket/my-folder/` into `./my-folder/`.
 python s3upload.py --upload ./my-folder --dry-run
 ```
 
-Always a good idea before a large upload.
+Always a good idea before a large upload. Dry run never touches S3.
+
+### Tuning workers
+
+```bash
+# more parallelism on a fast connection
+python s3upload.py --upload ./my-folder --workers 8
+
+# conservative on a slow or metered connection
+python s3upload.py --upload ./my-folder --workers 2
+```
+
+Each large file also uses multipart upload internally (16 MB chunks, 8 concurrent parts per file), so a single large file will saturate the connection even at `--workers 1`.
 
 ---
 
@@ -102,12 +117,17 @@ export S3_ENDPOINT_URL="https://s3.us-west-004.backblazeb2.com"
 ## Output
 
 ```
-UPLOAD               my-folder/checkpoints/model.safetensors
-SKIP already exists  my-folder/lora/style.safetensors
-UPLOAD               my-folder/embeddings/token.pt
+Scanning 10 file(s)...
+SKIP  my-folder/assets/background.png
+UPLOAD  my-folder/data/archive.bin  (4.2 GB)
+  archive.bin  1.1 GB/4.2 GB  (26%)
+UPLOAD  my-folder/config/settings.json  (1.4 MB)
+  settings.json  1.4 MB/1.4 MB  (100%)
 
 Uploaded: 2  Skipped: 1  Errors: 0
 ```
+
+Files upload concurrently so multiple progress lines may interleave.
 
 ---
 
@@ -310,7 +330,7 @@ export S3_ENDPOINT_URL="https://<account-id>.r2.cloudflarestorage.com"
 
 ## Cost estimate (AWS S3)
 
-For reference, storing 100 GB of model files on AWS S3 in `us-east-1`:
+For reference, storing 100 GB of files on AWS S3 in `us-east-1`:
 
 | Item | Cost |
 |------|------|
