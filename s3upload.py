@@ -2,6 +2,10 @@ import argparse
 import os
 import sys
 import threading
+
+from dotenv import load_dotenv
+
+load_dotenv()
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
