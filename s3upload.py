@@ -2,12 +2,12 @@ import argparse
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -52,8 +52,7 @@ def get_s3_client(config: dict):
     if config["endpoint_url"]:
         kwargs["endpoint_url"] = config["endpoint_url"]
     try:
-        client = boto3.client("s3", **kwargs)
-        return client
+        return boto3.client("s3", **kwargs)
     except NoCredentialsError:
         sys.exit("ERROR: AWS credentials not found. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.")
 
@@ -62,15 +61,13 @@ def get_s3_client(config: dict):
 # path helpers
 # ---------------------------------------------------------------------------
 
-def build_s3_key(local_path: Path, base_dir: Path, prefix: str) -> str:
+def local_to_s3_key(local_path: Path, base_dir: Path, prefix: str) -> str:
     relative = local_path.relative_to(base_dir.parent)
     key = str(relative).replace("\\", "/")
-    if prefix:
-        key = f"{prefix}/{key}"
-    return key
+    return f"{prefix}/{key}" if prefix else key
 
 
-def build_local_path(s3_key: str, prefix: str, download_dir: Path) -> Path:
+def s3_to_local_path(s3_key: str, prefix: str, download_dir: Path) -> Path:
     key = s3_key
     if prefix and key.startswith(prefix + "/"):
         key = key[len(prefix) + 1:]
@@ -78,16 +75,13 @@ def build_local_path(s3_key: str, prefix: str, download_dir: Path) -> Path:
 
 
 def should_skip_file(path: Path, include_hidden: bool) -> bool:
-    if path.name in SKIP_NAMES:
-        return True
-    if path.suffix in SKIP_EXTENSIONS:
-        return True
-    if not include_hidden and path.name.startswith("."):
+    if path.name in SKIP_NAMES or path.suffix in SKIP_EXTENSIONS:
         return True
     if not include_hidden:
-        for part in path.parts:
-            if part.startswith(".") and part not in (".", ".."):
-                return True
+        return path.name.startswith(".") or any(
+            part.startswith(".") and part not in (".", "..")
+            for part in path.parts
+        )
     return False
 
 
@@ -114,12 +108,16 @@ def fmt_size(n: int) -> str:
 # s3 helpers
 # ---------------------------------------------------------------------------
 
+def _is_not_found_error(e: ClientError) -> bool:
+    return e.response["Error"]["Code"] in ("404", "NoSuchKey")
+
+
 def object_exists(client, bucket: str, key: str) -> bool:
     try:
         client.head_object(Bucket=bucket, Key=key)
         return True
     except ClientError as e:
-        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+        if _is_not_found_error(e):
             return False
         raise
 
@@ -150,154 +148,188 @@ class Progress:
 
 
 # ---------------------------------------------------------------------------
+# transfer primitives
+# ---------------------------------------------------------------------------
+
+def _transfer_upload(client, bucket: str, local_path: Path, key: str, print_lock: threading.Lock):
+    size = local_path.stat().st_size
+    with print_lock:
+        print(f"UPLOAD  {key}  ({fmt_size(size)})")
+    progress = Progress(key.split("/")[-1], size, print_lock)
+    client.upload_file(str(local_path), bucket, key, Config=TRANSFER_CONFIG, Callback=progress)
+
+
+def _transfer_download(client, bucket: str, key: str, local_path: Path, size: int, print_lock: threading.Lock):
+    with print_lock:
+        print(f"DOWNLOAD  {key}  ({fmt_size(size)})")
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    progress = Progress(key.split("/")[-1], size, print_lock) if size > 0 else None
+    client.download_file(bucket, key, str(local_path), Config=TRANSFER_CONFIG, Callback=progress)
+
+
+def _run_transfers(futures: dict, print_lock: threading.Lock) -> tuple[int, int]:
+    success, errors = 0, 0
+    for future in as_completed(futures):
+        key = futures[future]
+        try:
+            future.result()
+            success += 1
+        except ClientError as e:
+            with print_lock:
+                print(f"ERROR  {key}  ({e})")
+            errors += 1
+    return success, errors
+
+
+# ---------------------------------------------------------------------------
+# dry-run reporting
+# ---------------------------------------------------------------------------
+
+def _print_dry_run(items: list[tuple[str, int]], action: str, skipped: int, errors: int):
+    for key, size in items:
+        print(f"{action} (dry-run)  {key}  ({fmt_size(size)})")
+    print(f"\nWould {action.lower()}: {len(items)}  Skipped: {skipped}  Errors: {errors}")
+
+
+# ---------------------------------------------------------------------------
 # upload
 # ---------------------------------------------------------------------------
 
-def _upload_one(client, bucket: str, local_path: Path, key: str, print_lock: threading.Lock):
-    size = local_path.stat().st_size
-    label = key.split("/")[-1]
-    with print_lock:
-        print(f"UPLOAD  {key}  ({fmt_size(size)})")
-    cb = Progress(label, size, print_lock)
-    client.upload_file(
-        str(local_path), bucket, key,
-        Config=TRANSFER_CONFIG,
-        Callback=cb,
-    )
+def _collect_uploads(
+    client, config: dict, directory: Path, overwrite: bool, include_hidden: bool,
+) -> tuple[list[tuple[Path, str, int]], int, int]:
+    bucket = config["bucket"]
+    prefix = config["prefix"]
+    pending, skipped, errors = [], 0, 0
+
+    all_files = list(iter_local_files(directory, include_hidden))
+    print(f"Scanning {len(all_files)} file(s)...")
+
+    for local_path in all_files:
+        key = local_to_s3_key(local_path, directory, prefix)
+        try:
+            if not overwrite and object_exists(client, bucket, key):
+                print(f"SKIP  {key}")
+                skipped += 1
+            else:
+                pending.append((local_path, key, local_path.stat().st_size))
+        except ClientError as e:
+            print(f"ERROR  {key}  ({e})")
+            errors += 1
+
+    return pending, skipped, errors
+
+
+def upload_file(client, config: dict, file_path: Path, overwrite: bool, dry_run: bool):
+    bucket = config["bucket"]
+    prefix = config["prefix"]
+    key = f"{prefix}/{file_path.name}" if prefix else file_path.name
+
+    if not dry_run and not overwrite and object_exists(client, bucket, key):
+        print(f"SKIP  {key}")
+        return
+
+    if dry_run:
+        print(f"UPLOAD (dry-run)  {key}  ({fmt_size(file_path.stat().st_size)})")
+        return
+
+    _transfer_upload(client, bucket, file_path, key, threading.Lock())
 
 
 def upload_directory(
     client, config: dict, directory: Path,
     overwrite: bool, dry_run: bool, include_hidden: bool, workers: int,
 ):
-    bucket = config["bucket"]
-    prefix = config["prefix"]
-    print_lock = threading.Lock()
-
-    # collect work: check existence first (fast head_object calls)
-    to_upload: list[tuple[Path, str]] = []
-    skipped = 0
-    errors = 0
-
-    all_files = list(iter_local_files(directory, include_hidden))
-    print(f"Scanning {len(all_files)} file(s)...")
-
-    for local_path in all_files:
-        key = build_s3_key(local_path, directory, prefix)
-        try:
-            if not dry_run and not overwrite and object_exists(client, bucket, key):
-                print(f"SKIP  {key}")
-                skipped += 1
-            else:
-                to_upload.append((local_path, key))
-        except Exception as e:
-            print(f"ERROR  {key}  ({e})")
-            errors += 1
+    pending, skipped, errors = _collect_uploads(client, config, directory, overwrite, include_hidden)
 
     if dry_run:
-        for _, key in to_upload:
-            size = next(
-                (p.stat().st_size for p, k in [(lp, k2) for lp, k2 in to_upload if k2 == key]),
-                0,
-            )
-            print(f"UPLOAD (dry-run)  {key}")
-        print(f"\nWould upload: {len(to_upload)}  Skipped: {skipped}  Errors: {errors}")
+        _print_dry_run([(key, size) for _, key, size in pending], "UPLOAD", skipped, errors)
         return
 
-    uploaded = 0
+    print_lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_upload_one, client, bucket, lp, key, print_lock): key
-            for lp, key in to_upload
+            pool.submit(_transfer_upload, client, config["bucket"], local_path, key, print_lock): key
+            for local_path, key, _ in pending
         }
-        for future in as_completed(futures):
-            key = futures[future]
-            try:
-                future.result()
-                uploaded += 1
-            except Exception as e:
-                with print_lock:
-                    print(f"ERROR  {key}  ({e})")
-                errors += 1
+        uploaded, transfer_errors = _run_transfers(futures, print_lock)
 
-    print(f"\nUploaded: {uploaded}  Skipped: {skipped}  Errors: {errors}")
+    print(f"\nUploaded: {uploaded}  Skipped: {skipped}  Errors: {errors + transfer_errors}")
 
 
 # ---------------------------------------------------------------------------
 # download
 # ---------------------------------------------------------------------------
 
-def _download_one(client, bucket: str, key: str, local_path: Path, size: int, print_lock: threading.Lock):
-    label = key.split("/")[-1]
-    with print_lock:
-        print(f"DOWNLOAD  {key}  ({fmt_size(size)})")
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    cb = Progress(label, size, print_lock) if size > 0 else None
-    client.download_file(
-        bucket, key, str(local_path),
-        Config=TRANSFER_CONFIG,
-        Callback=cb,
-    )
+def _collect_downloads(
+    client, config: dict, directory: Path, overwrite: bool,
+) -> tuple[list[tuple[str, Path, int]], int, int]:
+    bucket = config["bucket"]
+    prefix = config["prefix"]
+    list_prefix = f"{prefix}/{directory.name}" if prefix else directory.name
+    pending, skipped, errors = [], 0, 0
+
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=list_prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/"):
+                continue
+            local_path = s3_to_local_path(key, prefix, directory)
+            size = obj.get("Size", 0)
+            if not overwrite and local_path.exists():
+                print(f"SKIP  {local_path}")
+                skipped += 1
+            else:
+                pending.append((key, local_path, size))
+
+    return pending, skipped, errors
+
+
+def download_file(
+    client, config: dict, s3_key: str,
+    output: Path | None, overwrite: bool, dry_run: bool,
+):
+    bucket = config["bucket"]
+    prefix = config["prefix"]
+    full_key = f"{prefix}/{s3_key}" if prefix and not s3_key.startswith(prefix + "/") else s3_key
+    local_path = output if output else Path.cwd() / full_key.split("/")[-1]
+
+    if not dry_run and not overwrite and local_path.exists():
+        print(f"SKIP  {local_path}")
+        return
+
+    try:
+        size = client.head_object(Bucket=bucket, Key=full_key)["ContentLength"]
+    except ClientError as e:
+        sys.exit(f"ERROR: {full_key}  ({e})")
+
+    if dry_run:
+        print(f"DOWNLOAD (dry-run)  {full_key}  ({fmt_size(size)})  ->  {local_path}")
+        return
+
+    _transfer_download(client, bucket, full_key, local_path, size, threading.Lock())
 
 
 def download_directory(
     client, config: dict, directory: Path,
     overwrite: bool, dry_run: bool, include_hidden: bool, workers: int,
 ):
-    bucket = config["bucket"]
-    prefix = config["prefix"]
-    print_lock = threading.Lock()
-
-    dir_name = directory.name
-    list_prefix = f"{prefix}/{dir_name}" if prefix else dir_name
-
-    to_download: list[tuple[str, Path, int]] = []
-    skipped = 0
-    errors = 0
-
-    paginator = client.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=bucket, Prefix=list_prefix)
-
-    for page in pages:
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith("/"):
-                continue
-            local_path = build_local_path(key, prefix, directory)
-            size = obj.get("Size", 0)
-            try:
-                if not dry_run and not overwrite and local_path.exists():
-                    print(f"SKIP  {local_path}")
-                    skipped += 1
-                else:
-                    to_download.append((key, local_path, size))
-            except Exception as e:
-                print(f"ERROR  {key}  ({e})")
-                errors += 1
+    pending, skipped, errors = _collect_downloads(client, config, directory, overwrite)
 
     if dry_run:
-        for key, _, size in to_download:
-            print(f"DOWNLOAD (dry-run)  {key}  ({fmt_size(size)})")
-        print(f"\nWould download: {len(to_download)}  Skipped: {skipped}  Errors: {errors}")
+        _print_dry_run([(key, size) for key, _, size in pending], "DOWNLOAD", skipped, errors)
         return
 
-    downloaded = 0
+    print_lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_download_one, client, bucket, key, lp, size, print_lock): key
-            for key, lp, size in to_download
+            pool.submit(_transfer_download, client, config["bucket"], key, local_path, size, print_lock): key
+            for key, local_path, size in pending
         }
-        for future in as_completed(futures):
-            key = futures[future]
-            try:
-                future.result()
-                downloaded += 1
-            except Exception as e:
-                with print_lock:
-                    print(f"ERROR  {key}  ({e})")
-                errors += 1
+        downloaded, transfer_errors = _run_transfers(futures, print_lock)
 
-    print(f"\nDownloaded: {downloaded}  Skipped: {skipped}  Errors: {errors}")
+    print(f"\nDownloaded: {downloaded}  Skipped: {skipped}  Errors: {errors + transfer_errors}")
 
 
 # ---------------------------------------------------------------------------
@@ -321,8 +353,10 @@ Optional:
         """,
     )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--upload", metavar="DIR", help="Local directory to upload")
+    group.add_argument("--upload", metavar="PATH", help="Local file or directory to upload")
     group.add_argument("--download", metavar="DIR", help="Local directory to download into")
+    group.add_argument("--download-file", metavar="S3_KEY", help="Single S3 object key to download")
+    parser.add_argument("--output", metavar="PATH", help="Local destination for --download-file (default: cwd/filename)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen without doing it")
     parser.add_argument("--include-hidden", action="store_true", help="Include hidden files and directories")
@@ -339,10 +373,16 @@ def main():
     client = get_s3_client(config)
 
     if args.upload:
-        directory = Path(args.upload).resolve()
-        if not directory.is_dir():
-            sys.exit(f"ERROR: {args.upload} is not a directory.")
-        upload_directory(client, config, directory, args.overwrite, args.dry_run, args.include_hidden, args.workers)
+        path = Path(args.upload).resolve()
+        if path.is_file():
+            upload_file(client, config, path, args.overwrite, args.dry_run)
+        elif path.is_dir():
+            upload_directory(client, config, path, args.overwrite, args.dry_run, args.include_hidden, args.workers)
+        else:
+            sys.exit(f"ERROR: {args.upload} is not a file or directory.")
+    elif args.download_file:
+        output = Path(args.output).resolve() if args.output else None
+        download_file(client, config, args.download_file, output, args.overwrite, args.dry_run)
     else:
         directory = Path(args.download).resolve()
         download_directory(client, config, directory, args.overwrite, args.dry_run, args.include_hidden, args.workers)
