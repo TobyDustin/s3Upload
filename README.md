@@ -55,12 +55,26 @@ python s3upload.py --download ./my-folder
 
 Downloads everything under `s3://your-bucket/my-folder/` into `./my-folder/`.
 
+### Download a single file
+
+```bash
+python s3upload.py --download-file path/to/file.bin
+```
+
+Downloads one S3 object into the current directory. Use `--output` to set a custom local path:
+
+```bash
+python s3upload.py --download-file path/to/file.bin --output ./local_name.bin
+```
+
 ### Options
 
 | Flag | Description |
 |------|-------------|
 | `--upload <dir>` | Upload local directory to S3 |
 | `--download <dir>` | Download from S3 into local directory |
+| `--download-file <key>` | Download a single S3 object |
+| `--output <path>` | Local destination for `--download-file` (default: cwd/filename) |
 | `--overwrite` | Overwrite files that already exist |
 | `--dry-run` | Show what would happen without doing anything (no S3 calls) |
 | `--include-hidden` | Include hidden files and directories (`.dotfiles`) |
